@@ -6,3 +6,4 @@ lightgbm==4.5.0
 joblib==1.4.2
 pyyaml==6.0.2
 matplotlib==3.9.2
+pyarrow==17.0.0
