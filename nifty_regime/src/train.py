@@ -21,15 +21,37 @@ REPORT_DIR.mkdir(exist_ok=True)
 
 def make_dataset(horizon=5):
     df = load_nifty(start="2007-01-01")
+    print(f"[train] raw rows: {len(df)}  range: "
+          f"{df.index.min().date()} -> {df.index.max().date()}")
+
+    if len(df) < 500:
+        raise RuntimeError(
+            f"[train] too few rows ({len(df)}). Likely a download issue — "
+            "check the debug workflow output."
+        )
+
     X = build_features(df)
     y = label_regimes(df, horizon=horizon)
+
     data = pd.concat([X, y.rename("label")], axis=1).dropna()
+    print(f"[train] after dropna: {len(data)} rows")
+
+    if len(data) < 300:
+        raise RuntimeError(
+            f"[train] too few usable rows ({len(data)}). "
+            "Check features/labels for excessive NaNs."
+        )
+
     X = data.drop(columns="label")
     y = data["label"].astype(int)
     return X, y
 
 
 def cv_score(model, X, y, n_splits=4):
+    if len(X) < (n_splits + 1) * 20:
+        raise RuntimeError(
+            f"[train] not enough rows for {n_splits}-fold CV: {len(X)}"
+        )
     tscv = TimeSeriesSplit(n_splits=n_splits)
     scores = []
     for tr, te in tscv.split(X):
