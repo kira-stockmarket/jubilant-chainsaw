@@ -1,0 +1,49 @@
+name: Train Regime Model
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"    # every Sunday 03:00 UTC = 08:30 IST
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache Nifty data
+        uses: actions/cache@v4
+        with:
+          path: nifty_regime/data
+          key: nifty-data-${{ github.run_id }}
+          restore-keys: |
+            nifty-data-
+
+      - name: Train
+        run: python scripts/run_all.py train
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: regime-model
+          path: nifty_regime/models/regime_model.joblib
+          retention-days: 30
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-reports
+          path: nifty_regime/reports/
+          retention-days: 30
