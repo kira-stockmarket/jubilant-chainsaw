@@ -1,0 +1,51 @@
+name: Daily Nifty Regime
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * 1-5"   # 12:00 UTC = 17:30 IST on weekdays
+
+jobs:
+  regime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download latest trained model
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: train.yml
+          workflow_conclusion: success
+          name: regime-model
+          path: nifty_regime/models
+          if_no_artifact_found: fail
+
+      - name: Cache Nifty data
+        uses: actions/cache@v4
+        with:
+          path: nifty_regime/data
+          key: nifty-data-daily-${{ github.run_id }}
+          restore-keys: |
+            nifty-data-
+
+      - name: Predict today's regime
+        run: python scripts/run_all.py predict
+
+      - name: Upload regime report
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-regime
+          path: nifty_regime/reports/latest_regime.json
+          retention-days: 60
