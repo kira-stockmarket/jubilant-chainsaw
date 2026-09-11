@@ -1,0 +1,15 @@
+data:
+  ticker: "^NSEI"
+  start: "2007-01-01"
+  interval: "1d"
+
+labeling:
+  horizon: 5
+  trend_threshold: 0.025
+  range_threshold: 0.02
+  high_vol_quantile: 0.75
+  low_vol_quantile: 0.25
+
+model:
+  cv_splits: 4
+  candidates: ["LogReg", "LightGBM"]
