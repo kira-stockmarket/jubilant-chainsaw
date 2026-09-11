@@ -1,26 +1,44 @@
 import time
-import io
+import os
 from pathlib import Path
 
 import pandas as pd
 import requests
+
+# Fresh CA bundle for GH runners
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except ImportError:
+    pass
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 REQUIRED_COLS = ["open", "high", "low", "close", "volume"]
 
+NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
+
 
 # ---------------------------------------------------------------------------
-# Dependency guards
+# Dependency guard
 # ---------------------------------------------------------------------------
 def _ensure_parquet_engine():
     try:
         import pyarrow  # noqa: F401
     except ImportError as e:
         raise ImportError(
-            "pyarrow is required for parquet caching. "
-            "Add `pyarrow` to requirements.txt. Original error: " + str(e)
+            "pyarrow is required. Add pyarrow to requirements.txt. " + str(e)
         )
 
 
@@ -42,9 +60,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"[loader] missing columns: {missing}. Got: {list(df.columns)}"
-        )
+        raise ValueError(f"[loader] missing columns: {missing}. Got: {list(df.columns)}")
 
     df = df[REQUIRED_COLS].dropna()
     df.index.name = "date"
@@ -52,7 +68,7 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Cache helpers
+# Cache
 # ---------------------------------------------------------------------------
 def _write_cache(df: pd.DataFrame, interval: str):
     path = DATA_DIR / f"nifty_{interval}.parquet"
@@ -71,86 +87,50 @@ def _read_cache(interval: str):
 
 
 # ---------------------------------------------------------------------------
-# Source 1: nselib  (primary — works from CI)
+# Source 1: NSE India direct API (primary)
 # ---------------------------------------------------------------------------
-def _download_nselib(start, end):
-    """
-    nselib returns NSE index historical data.
-    Symbol for Nifty 50 index is 'NIFTY 50'.
-    """
+def _nse_session():
+    """Open a requests session with NSE cookies warm."""
+    s = requests.Session()
+    s.headers.update(NSE_HEADERS)
     try:
-        from nselib import capital_market
-        print("[loader] nselib: requesting NIFTY 50 ...")
-
-        # nselib expects from_date / to_date as 'DD-MM-YYYY'
-        from_dt = pd.Timestamp(start).strftime("%d-%m-%Y")
-        to_dt = pd.Timestamp(end).strftime("%d-%m-%Y") if end else pd.Timestamp.today().strftime("%d-%m-%Y")
-
-        df = capital_market.index_data(
-            index="NIFTY 50",
-            from_date=from_dt,
-            to_date=to_dt,
-        )
-
-        if df is None or len(df) == 0:
-            print("[loader] nselib returned empty")
-            return None
-
-        df.columns = [c.strip().lower() for c in df.columns]
-        # nselib columns typically: 'date', 'open', 'high', 'low', 'close', 'volume' (volume may be absent for index)
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df[df["date"].notna()].set_index("date").sort_index()
-
-        if "volume" not in df.columns:
-            df["volume"] = 0
-
-        print(f"[loader] nselib OK: {len(df)} rows")
-        return df[REQUIRED_COLS]
-
+        s.get("https://www.nseindia.com", timeout=15)
+        s.get("https://www.nseindia.com/market-data/live-equity-market", timeout=15)
     except Exception as e:
-        print(f"[loader] nselib failed: {type(e).__name__}: {e}")
-        return None
+        print(f"[loader] NSE warm-up warning: {e}")
+    return s
 
 
-# ---------------------------------------------------------------------------
-# Source 2: NSE India direct CSV (backup)
-# ---------------------------------------------------------------------------
 def _download_nse_direct(start, end):
-    """
-    Direct NSE India historical index CSV endpoint.
-    Uses the official NSE API used by their website — stable.
-    """
     try:
-        print("[loader] NSE direct CSV: requesting ...")
+        print("[loader] NSE direct: requesting ...")
+        from_dt = pd.Timestamp(start).strftime("%d-%m-%Y")
+        to_dt = (pd.Timestamp(end) if end else pd.Timestamp.today()).strftime("%d-%m-%Y")
+
         url = (
             "https://www.nseindia.com/api/historical/indicesHistory"
-            f"?indexType=NIFTY%2050&from={pd.Timestamp(start).strftime('%d-%m-%Y')}"
-            f"&to={(pd.Timestamp(end) if end else pd.Timestamp.today()).strftime('%d-%m-%Y')}"
+            f"?indexType=NIFTY%2050&from={from_dt}&to={to_dt}"
         )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.nseindia.com/",
-        }
-        s = requests.Session()
-        s.get("https://www.nseindia.com", headers=headers, timeout=15)  # cookie warm-up
-        r = s.get(url, headers=headers, timeout=30)
+
+        s = _nse_session()
+        r = s.get(url, timeout=30)
         r.raise_for_status()
         js = r.json()
 
-        rows = js.get("data", {}).get("indexCloseOnlineRecords") or \
-               js.get("data", {}).get("indexPortfolioData") or []
+        data = js.get("data", {})
+        rows = (
+            data.get("indexCloseOnlineRecords")
+            or data.get("indexPortfolioData")
+            or []
+        )
         if not rows:
-            print(f"[loader] NSE direct: no rows in response. keys={list(js.keys())}")
+            print(f"[loader] NSE direct: empty. top-level keys={list(js.keys())}, "
+                  f"data keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}")
             return None
 
         df = pd.DataFrame(rows)
         df.columns = [c.strip().lower() for c in df.columns]
 
-        # Typical columns: EOD_TIMESTAMP, EOD_OPEN_INDEX_VAL, EOD_HIGH_INDEX_VAL, EOD_LOW_INDEX_VAL, EOD_CLOSE_INDEX_VAL
         rename_map = {
             "eod_timestamp": "date",
             "eod_open_index_val": "open",
@@ -166,11 +146,11 @@ def _download_nse_direct(start, end):
 
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df[df["date"].notna()].set_index("date").sort_index()
-        df["volume"] = 0
 
         for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["open", "high", "low", "close"])
+        df["volume"] = 0
 
         print(f"[loader] NSE direct OK: {len(df)} rows")
         return df[REQUIRED_COLS]
@@ -181,7 +161,7 @@ def _download_nse_direct(start, end):
 
 
 # ---------------------------------------------------------------------------
-# Source 3: yfinance (last resort)
+# Source 2: yfinance (fallback)
 # ---------------------------------------------------------------------------
 def _download_yahoo_with_retry(start, end, interval, max_attempts=2):
     import yfinance as yf
@@ -219,9 +199,8 @@ def load_nifty(start="2007-01-01", end=None, interval="1d", force=False):
             return cached
 
     candidates = [
-        ("nselib",      lambda: _download_nselib(start, end)),
-        ("nse_direct",  lambda: _download_nse_direct(start, end)),
-        ("yahoo",       lambda: _download_yahoo_with_retry(start, end, interval)),
+        ("nse_direct", lambda: _download_nse_direct(start, end)),
+        ("yahoo",      lambda: _download_yahoo_with_retry(start, end, interval)),
     ]
 
     raw = None
@@ -239,13 +218,14 @@ def load_nifty(start="2007-01-01", end=None, interval="1d", force=False):
 
     if raw is None or len(raw) == 0:
         raise RuntimeError(
-            "[loader] all data sources failed (nselib, nse_direct, yahoo). "
-            "This is usually temporary — retry in a few minutes."
+            "[loader] all data sources failed (nse_direct, yahoo). "
+            "Retry in a few minutes."
         )
 
     df = _normalize(raw)
     _write_cache(df, interval)
-    print(f"[loader] saved {len(df)} rows ({df.index.min().date()} -> {df.index.max().date()})")
+    print(f"[loader] saved {len(df)} rows "
+          f"({df.index.min().date()} -> {df.index.max().date()})")
     return df
 
 
